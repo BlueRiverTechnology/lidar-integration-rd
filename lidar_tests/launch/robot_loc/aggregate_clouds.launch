@@ -35,7 +35,8 @@
   	<param name="child_frame_id" value="gps"/>
   	<param name="voxel_leaf_size" value="-0.05"/>
   	<param name="min_distance" value="0.2"/>
-  	<param name="do_plane_adjustment" value="true"/>\
+  	<param name="apply_plane_adjustment" value="true"/>
+  	<param name="apply_smoothing" value="true"/>
   	<param name="align_clouds" value="false"/>
   	<param name="max_cloud_count" value="$(arg max_cloud_count)"/>
   	<rosparam param="min_box_bounds">[-4.0, 1.0, -5.0]</rosparam>

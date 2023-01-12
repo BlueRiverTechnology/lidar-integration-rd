@@ -18,6 +18,8 @@
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/surface/mls.h>
 
 #include <sensor_msgs/PointCloud2.h>
 
@@ -101,7 +103,7 @@ public:
     child_frame_id_("gps"),
     target_frame_id_("odom"),
     offset_transform_(Eigen::Isometry3d::Identity()),
-    do_plane_adjustment_(false),
+    apply_plane_adjustment_(false),
     align_clouds_(false),
     max_cloud_count_(100),
     min_distance_(1.0),
@@ -116,7 +118,8 @@ public:
     ros::NodeHandle ph("~");
     ph.param("max_cloud_count", max_cloud_count_, 500);
     ph.param("voxel_leaf_size", voxel_leaf_size_, 0.05);
-    ph.param("do_plane_adjustment", do_plane_adjustment_, false);
+    ph.param("apply_plane_adjustment", apply_plane_adjustment_, false);
+    ph.param("apply_smoothing_", apply_smoothing_, false);
     ph.param("align_clouds", align_clouds_, false);
     min_distance_ = LoadParameter<double>(ph, "min_distance");
     child_frame_id_ = LoadParameter<std::string>(ph, "child_frame_id");
@@ -192,7 +195,7 @@ private:
     Eigen::Vector3d current_position = current_pose.translation();
 
     double dist = (current_position - prev_position).norm();
-    ROS_INFO("Distance %f, required min distance %f", dist, min_distance_);
+    ROS_DEBUG("Distance %f, required min distance %f", dist, min_distance_);
     if(dist < min_distance_)
     {
       return;
@@ -201,7 +204,7 @@ private:
     previous_cloud_pose_ = current_pose;
 
     clouds_list_.emplace_back(std::move(cloud_entry));
-    ROS_INFO_STREAM("Stored cloud, total cloud count " << clouds_list_.size());
+    ROS_DEBUG_STREAM("Stored cloud, total cloud count " << clouds_list_.size());
   }
 
   void ApplyPlaneRectification(CloudT::Ptr cloud)
@@ -227,16 +230,37 @@ private:
     Eigen::Vector3d plane_normal(coeff->values[0], coeff->values[1], coeff->values[2]);
     double angle = std::acos(plane_normal.dot(Eigen::Vector3d::UnitZ())/(plane_normal.norm()));
     Eigen::Vector3d rot_axis = plane_normal.cross(Eigen::Vector3d::UnitZ()).normalized();
-    ROS_INFO_STREAM("Angle Axes values: " << angle <<" x: " << rot_axis.x() << " y: " << rot_axis.y() << " z: " << rot_axis.z());
+    ROS_DEBUG_STREAM("Angle Axes values: " << angle <<" x: " << rot_axis.x() << " y: " << rot_axis.y() << " z: " << rot_axis.z());
 
     // computing centroid
     Eigen::Vector4d centroid_vals;
     pcl::compute3DCentroid(*cloud, centroid_vals);
     Eigen::Vector3d centroid(centroid_vals.x(), centroid_vals.y(), centroid_vals.z());
 
+    // moving to world plane level (z = 0)
     Eigen::Affine3d cloud_transform = Eigen::Translation3d( centroid.x(), centroid.y(), 0.0) * Eigen::AngleAxisd(angle, rot_axis)
         * Eigen::Translation3d(-1.0 * centroid)*Eigen::Quaterniond::Identity();
      pcl::transformPointCloud(*cloud, *cloud, cloud_transform, true);
+  }
+
+  void SmoothCloudMLS(CloudT::Ptr cloud)
+  {
+    pcl::MovingLeastSquares<pcl::PointXYZ, pcl::PointNormal> mls;
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr search_tree (new pcl::search::KdTree<pcl::PointXYZ>);
+
+    mls.setComputeNormals (true);
+
+    // Set parameters
+    mls.setInputCloud(cloud);
+    mls.setPolynomialOrder(3);
+    mls.setSearchMethod (search_tree);
+    mls.setSearchRadius (0.2);
+
+    // Reconstruct
+    pcl::PointCloud<pcl::PointNormal> mls_points;
+    mls.process(mls_points);
+    cloud->clear();
+    pcl::copyPointCloud(mls_points, *cloud);
   }
 
   void AlignCloudNDT(CloudT::ConstPtr target_cloud, CloudT::Ptr input_cloud)
@@ -268,7 +292,7 @@ private:
     pcl::IterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> icp;
     icp.setInputSource(input_cloud);
     icp.setInputTarget(target_cloud);
-    icp.setMaximumIterations (100); // Setting max number of registration iterations.
+    icp.setMaximumIterations (10); // Setting max number of registration iterations.
 
     CloudT::Ptr aligned_cloud = boost::make_shared<CloudT>();
     icp.align(*aligned_cloud, Eigen::Isometry3f::Identity().matrix());
@@ -316,9 +340,14 @@ private:
       pcl::transformPointCloud(*raw_cloud, *transformed_cloud, Eigen::Affine3d(current_pose), true);
 
       // forcing cloud to ground plane
-      if(do_plane_adjustment_)
+      if(apply_plane_adjustment_)
       {
         ApplyPlaneRectification(transformed_cloud);
+      }
+
+      if(apply_smoothing_)
+      {
+        SmoothCloudMLS(transformed_cloud);
       }
 
       if(align_clouds_ && !previous_processed_cloud_->empty())
@@ -334,9 +363,12 @@ private:
     }
     clouds_list_.clear();
     *aggregate_cloud_ += temp_aggregate_cloud;
-    //ApplyPlaneRectification(aggregate_cloud_);
+
+    CloudT::PointType min_point, max_point;
+    pcl::getMinMax3D(temp_aggregate_cloud, min_point, max_point);
     ros::Duration processing_duration = ros::Time::now() - start_time;
-    ROS_INFO_STREAM("Aggregation processing took " << processing_duration.toSec() <<" seconds");
+    ROS_INFO_STREAM("Aggregation processing took " << processing_duration.toSec() <<" seconds" <<
+                    ": minmax z( " << min_point.z <<", " << max_point.z <<")");
   }
 
   void ApplyCloudFilters(CloudT& cloud)
@@ -386,7 +418,8 @@ private:
   std::string child_frame_id_;
   std::string target_frame_id_;
   Eigen::Isometry3d offset_transform_;
-  bool do_plane_adjustment_;
+  bool apply_plane_adjustment_;
+  bool apply_smoothing_;
   bool align_clouds_;
   int max_cloud_count_;
   double min_distance_; // minimum distance from the previous cloud pose required to store new cloud
