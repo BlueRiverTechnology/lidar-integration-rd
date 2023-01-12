@@ -1,0 +1,14 @@
+digraph G {
+node [shape=box];
+"base_link" [label="base_link"];
+"os_sensor" [label="os_sensor"];
+"os_imu" [label="os_imu"];
+"os_lidar" [label="os_lidar"];
+node [shape=ellipse, color=blue, fontcolor=blue];
+"base_link" -> "sensor_link_joint" [label="xyz: 0 0 0 \nrpy: 0 -0 0"]
+"sensor_link_joint" -> "os_sensor"
+"os_sensor" -> "imu_link_joint" [label="xyz: 0.006253 -0.011775 0.007645 \nrpy: 0 -0 0"]
+"imu_link_joint" -> "os_imu"
+"os_sensor" -> "os_link_joint" [label="xyz: 0 0 0.03618 \nrpy: 0 -0 3.14159"]
+"os_link_joint" -> "os_lidar"
+}

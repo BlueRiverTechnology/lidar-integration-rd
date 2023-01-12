@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>lidar_tests</name>
+  <version>0.0.0</version>
+  <description>The lidar_tests package</description>
+  <maintainer email="jorgenicho@todo.todo">jorgenicho</maintainer>
+  <license>TODO</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  
+  <depend>pcl_ros</depend>
+  <depend>roscpp</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf_conversions</depend>
+  <depend>geometry_msgs</depend>
+
+  <!-- The export tag contains other, unspecified, tags -->
+  <export>
+  </export>
+</package>

@@ -1,0 +1,46 @@
+<launch>
+  <arg name="bag_filename"/>
+  <arg name="rviz" default="true"/>
+  <arg name="max_cloud_count" default="200"/>
+
+  <!-- starting bag file -->       
+  <node name="playbag" pkg="rosbag" type="play"
+      args="$(arg bag_filename) --topics /ouster/imu /ouster/points /fix" />
+      
+  <param name="robot_description"
+    textfile="$(find lidar_tests)/urdf/os1_sensor.urdf" />
+
+  <node name="robot_state_publisher" pkg="robot_state_publisher"
+    type="robot_state_publisher" >
+    <param name="publish_frequency" value="10"/>
+    <param name="use_tf_static" value="false"/>
+  </node>
+  
+  <node pkg="tf" type="static_transform_publisher" name="gps_publisher" args="0 0 0 0 0 0 gps base_link 10" />
+  
+        
+  <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" required="true"
+      args="-d $(find lidar_tests)/rviz/hdl_graph_slam.rviz" />
+      
+      
+  <node name="utm_odometry_node" type="utm_odometry_node" pkg="gps_common" required="true">
+  	<param name="frame_id" value="odom"/>
+  	<param name="child_frame_id" value="gps"/>
+  	<param name="extrapolate_poses" value="true"/>
+  	<rosparam param="position_offsets">[631902.0, 4090677.0, 0.0]</rosparam>
+  </node>
+  
+  <node name="cloud_aggregator" type="cloud_aggregator" pkg="lidar_tests" output="screen">
+	<param name="target_frame_id" value="odom"/>
+  	<param name="child_frame_id" value="gps"/>
+  	<param name="voxel_leaf_size" value="-0.05"/>
+  	<param name="min_distance" value="0.2"/>
+  	<param name="do_plane_adjustment" value="true"/>\
+  	<param name="align_clouds" value="false"/>
+  	<param name="max_cloud_count" value="$(arg max_cloud_count)"/>
+  	<rosparam param="min_box_bounds">[-4.0, 1.0, -5.0]</rosparam>
+  	<rosparam param="max_box_bounds">[4.0, 4.0, 5.0]</rosparam>
+  	<rosparam param="offset_transform">[0.0, 0.0, 0.0, -50.0, 0.0, 55.0]</rosparam><!--[x, y, x, euler_x, euler_y, euler_z]-->
+  	<remap from="/cloud_input" to="/ouster/points"/>
+  </node>
+</launch>
