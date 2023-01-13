@@ -1,7 +1,7 @@
 <launch>
   <arg name="bag_filename"/>
   <arg name="rviz" default="true"/>
-  <arg name="max_cloud_count" default="200"/>
+  <arg name="max_cloud_count" default="400"/>
 
   <!-- starting bag file -->       
   <node name="playbag" pkg="rosbag" type="play"
@@ -23,7 +23,7 @@
       args="-d $(find lidar_tests)/rviz/hdl_graph_slam.rviz" />
       
       
-  <node name="utm_odometry_node" type="utm_odometry_node" pkg="gps_common" required="true">
+  <node name="utm_odometry_node" type="utm_odometry_node" pkg="lidar_tests" required="true">
   	<param name="frame_id" value="odom"/>
   	<param name="child_frame_id" value="gps"/>
   	<param name="extrapolate_poses" value="true"/>
