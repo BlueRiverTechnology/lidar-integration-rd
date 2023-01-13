@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>lidar_tests</name>
+  <name>field_building</name>
   <version>0.0.0</version>
-  <description>The lidar_tests package</description>
+  <description>The field_building package</description>
   <maintainer email="jorgenicho@todo.todo">jorgenicho</maintainer>
   <license>TODO</license>
   <buildtool_depend>catkin</buildtool_depend>

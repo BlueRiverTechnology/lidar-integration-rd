@@ -8,7 +8,7 @@
       args="$(arg bag_filename) --topics /ouster/imu /ouster/points /fix" />
       
   <param name="robot_description"
-    textfile="$(find lidar_tests)/urdf/os1_sensor.urdf" />
+    textfile="$(find field_building)/urdf/os1_sensor.urdf" />
 
   <node name="robot_state_publisher" pkg="robot_state_publisher"
     type="robot_state_publisher" >
@@ -20,17 +20,17 @@
   
         
   <node if="$(arg rviz)" name="rviz" pkg="rviz" type="rviz" required="true"
-      args="-d $(find lidar_tests)/rviz/hdl_graph_slam.rviz" />
+      args="-d $(find field_building)/rviz/field_building.rviz" />
       
       
-  <node name="utm_odometry_node" type="utm_odometry_node" pkg="lidar_tests" required="true">
+  <node name="utm_odometry_node" type="utm_odometry_node" pkg="field_building" required="true">
   	<param name="frame_id" value="odom"/>
   	<param name="child_frame_id" value="gps"/>
   	<param name="extrapolate_poses" value="true"/>
   	<rosparam param="position_offsets">[631902.0, 4090677.0, 0.0]</rosparam>
   </node>
   
-  <node name="cloud_aggregator" type="cloud_aggregator" pkg="lidar_tests" output="screen">
+  <node name="cloud_aggregator" type="cloud_aggregator" pkg="field_building" output="screen">
 	<param name="target_frame_id" value="odom"/>
   	<param name="child_frame_id" value="gps"/>
   	<param name="voxel_leaf_size" value="-0.05"/>
