@@ -8,6 +8,9 @@
 #include <tf2_eigen/tf2_eigen.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
+#include <sensor_msgs/PointCloud2.h>
+#include <std_srvs/Trigger.h>
+
 #include <pcl_ros/point_cloud.h>
 #include <pcl/conversions.h>
 #include <pcl/common/transforms.h>
@@ -20,11 +23,16 @@
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <pcl/surface/mls.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+#include <pcl/octree/octree_pointcloud_voxelcentroid.h>
 
-#include <sensor_msgs/PointCloud2.h>
+#include <octomap/octomap.h>
+#include <octomap_msgs/conversions.h>
 
 static const std::string CLOUD_TOPIC = "cloud_input";
 static const std::string AGGREGATE_CLOUD_TOPIC = "aggregate_cloud";
+static const std::string OCTOMAP_TOPIC = "field_octomap";
+static const std::string BUILD_OCTOMAP_SERVICE = "build_field_octomap";
 static const int WAIT_TRANSFORM_PAUSE = 0.01;
 
 using CloudT = pcl::PointCloud<pcl::PointXYZ>;
@@ -40,6 +48,26 @@ Eigen::Isometry3d Interpolate(Eigen::Isometry3d& t1, Eigen::Isometry3d& t2, doub
   result.translation() = (1.0 - alpha) * trans1 + alpha * trans2;
   result.linear() = rot1.slerp(alpha, rot2).toRotationMatrix();
   return result;
+}
+
+octomap::OcTree BuildFieldOctomap(CloudT::ConstPtr cloud, const double resolution = 1.0)
+{
+  using PointT = CloudT::PointType;
+  std::vector< PointT, Eigen::aligned_allocator<PointT> > voxel_centers_vec;
+  {
+    pcl::octree::OctreePointCloudVoxelCentroid<PointT> octree(resolution);
+    octree.setInputCloud(cloud);
+    octree.addPointsFromInputCloud();
+    octree.getOccupiedVoxelCenters(voxel_centers_vec);
+  }
+  octomap::OcTree octree(resolution);
+  octree.enableChangeDetection(true);
+  for(const auto& voxel_center : voxel_centers_vec)
+  {
+    octree.updateNode(voxel_center.x, voxel_center.y, voxel_center.z, true, true);
+  }
+  octree.updateInnerOccupancy();
+  return octree;
 }
 
 std::optional<geometry_msgs::TransformStamped> GetTransform(tf2_ros::Buffer& tf_buffer, const std::string target_frame_id,
@@ -119,7 +147,7 @@ public:
     ph.param("max_cloud_count", max_cloud_count_, 500);
     ph.param("voxel_leaf_size", voxel_leaf_size_, 0.05);
     ph.param("apply_plane_adjustment", apply_plane_adjustment_, false);
-    ph.param("apply_smoothing_", apply_smoothing_, false);
+    ph.param("apply_smoothing", apply_smoothing_, false);
     ph.param("align_clouds", align_clouds_, false);
     min_distance_ = LoadParameter<double>(ph, "min_distance");
     child_frame_id_ = LoadParameter<std::string>(ph, "child_frame_id");
@@ -141,9 +169,30 @@ public:
     // Initializing ROS interfaces
     cloud_subscriber_ = nh.subscribe(CLOUD_TOPIC, 1, &CloudAggregator::CloudMsgCallback, this);
     aggregate_cloud_publisher_ = nh.advertise<sensor_msgs::PointCloud2>(AGGREGATE_CLOUD_TOPIC,1);
+    octomap_publisher_ = nh.advertise<octomap_msgs::Octomap>(OCTOMAP_TOPIC,1);
     aggregation_timer_ = nh.createTimer(ros::Duration(0.2), &CloudAggregator::AggregationCalback, this);
-    publish_cloud_timer_ = nh.createTimer(ros::Duration(2.0),[this](const ros::TimerEvent&){
+    publish_visualization_results_timer_ = nh.createTimer(ros::Duration(2.0),[this](const ros::TimerEvent&){
       PublishAggregateCloud();
+      PublishAggregateOctomap();
+    });
+    build_octomap_server_ = nh.advertiseService<std_srvs::Trigger::Request, std_srvs::Trigger::Response>(
+        BUILD_OCTOMAP_SERVICE,[this](std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res)-> bool{
+      ros::NodeHandle ph("~");
+      octomap_msg_ = boost::make_shared<octomap_msgs::Octomap>();
+
+      double octomap_resolution;
+      int mean_k;
+      double std_mult;
+      ph.param("octomap/resolution", octomap_resolution, 0.5);
+      ph.param("octomap/mean_k", mean_k, 10);
+      ph.param("octomap/stdv_mult", std_mult, 0.7);
+      CloudT::Ptr full_cloud = aggregate_cloud_->makeShared();
+      RemoveOutliers(full_cloud, mean_k, std_mult);
+      SmoothCloudMLS(full_cloud, 3/* polynomial order */, octomap_resolution);
+      octomap::OcTree octree = BuildFieldOctomap(full_cloud, octomap_resolution);
+      octomap_msgs::fullMapToMsg(octree, *octomap_msg_);
+      res.success = true;
+      return true;
     });
 
     application_start_time_ = ros::Time::now();
@@ -243,7 +292,7 @@ private:
      pcl::transformPointCloud(*cloud, *cloud, cloud_transform, true);
   }
 
-  void SmoothCloudMLS(CloudT::Ptr cloud)
+  void SmoothCloudMLS(CloudT::Ptr cloud, std::size_t polynomial_order = 3, double search_radius = 0.05)
   {
     pcl::MovingLeastSquares<pcl::PointXYZ, pcl::PointNormal> mls;
     pcl::search::KdTree<pcl::PointXYZ>::Ptr search_tree (new pcl::search::KdTree<pcl::PointXYZ>);
@@ -252,15 +301,24 @@ private:
 
     // Set parameters
     mls.setInputCloud(cloud);
-    mls.setPolynomialOrder(3);
+    mls.setPolynomialOrder(polynomial_order);
     mls.setSearchMethod (search_tree);
-    mls.setSearchRadius (0.2);
+    mls.setSearchRadius (search_radius);
 
     // Reconstruct
     pcl::PointCloud<pcl::PointNormal> mls_points;
     mls.process(mls_points);
     cloud->clear();
     pcl::copyPointCloud(mls_points, *cloud);
+  }
+
+  void RemoveOutliers(CloudT::Ptr cloud, std::size_t mean_k = 20, double stdv_mult = 1.0)
+  {
+    pcl::StatisticalOutlierRemoval<CloudT::PointType> statistical_outlier;
+    statistical_outlier.setInputCloud(cloud);
+    statistical_outlier.setMeanK(mean_k);
+    statistical_outlier.setStddevMulThresh(stdv_mult);
+    statistical_outlier.filter(*cloud);
   }
 
   void AlignCloudNDT(CloudT::ConstPtr target_cloud, CloudT::Ptr input_cloud)
@@ -393,6 +451,9 @@ private:
     crop_box.setInputCloud(filtered_cloud);
     crop_box.filter(*filtered_cloud);
 
+    // statistical outlier
+    RemoveOutliers(filtered_cloud);
+
     // copy results
     pcl::copyPointCloud(*filtered_cloud, cloud);
   }
@@ -406,11 +467,24 @@ private:
     aggregate_cloud_publisher_.publish(aggregate_cloud_msg);
   }
 
+  void PublishAggregateOctomap()
+  {
+    if(!octomap_msg_)
+    {
+      return;
+    }
+    octomap_msg_->header.frame_id = target_frame_id_;
+    octomap_msg_->header.stamp = ros::Time::now();
+    octomap_publisher_.publish(*octomap_msg_);
+  }
+
   // ros interfaces
   ros::Timer aggregation_timer_;
-  ros::Timer publish_cloud_timer_;
+  ros::Timer publish_visualization_results_timer_;
   ros::Subscriber cloud_subscriber_;
   ros::Publisher aggregate_cloud_publisher_;
+  ros::Publisher octomap_publisher_;
+  ros::ServiceServer build_octomap_server_;
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
 
@@ -427,6 +501,7 @@ private:
   std::array<double, 3> min_box_bounds_;
   std::array<double, 3> max_box_bounds_;
 
+
   // intermediate members
   std::optional<geometry_msgs::TransformStamped> previous_transform_msg_;
   CloudT::Ptr previous_processed_cloud_;
@@ -438,10 +513,9 @@ private:
 
   // output
   CloudT::Ptr aggregate_cloud_;
+  octomap_msgs::OctomapPtr octomap_msg_;
 
 };
-
-
 
 int main(int argc, char** argv)
 {

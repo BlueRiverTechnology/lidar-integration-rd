@@ -12,6 +12,7 @@ find_package(catkin REQUIRED
 	tf_conversions
 	geometry_msgs
 	gps_common
+	octomap_ros
 )
 
 ## System dependencies are found with CMake's conventions

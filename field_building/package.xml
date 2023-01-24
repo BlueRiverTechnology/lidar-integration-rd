@@ -13,6 +13,7 @@
   <depend>tf_conversions</depend>
   <depend>geometry_msgs</depend>
   <depend>gps_common</depend>
+  <depend>octomap_ros</depend>
 
   <!-- The export tag contains other, unspecified, tags -->
   <export>

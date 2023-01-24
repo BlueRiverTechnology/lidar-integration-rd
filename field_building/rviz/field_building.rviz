@@ -13,7 +13,8 @@ Panels:
         - /PointCloud21
         - /PointCloud21/Autocompute Value Bounds1
         - /MarkerArray1/Namespaces1
-      Splitter Ratio: 0.5
+        - /OccupancyGrid1
+      Splitter Ratio: 0.5060827136039734
     Tree Height: 1051
   - Class: rviz/Selection
     Name: Selection
@@ -78,7 +79,7 @@ Visualization Manager:
       Marker Alpha: 1
       Marker Scale: 10
       Name: TF
-      Show Arrows: true
+      Show Arrows: false
       Show Axes: true
       Show Names: true
       Tree:
@@ -112,8 +113,8 @@ Visualization Manager:
       Position Transformer: XYZ
       Queue Size: 1
       Selectable: true
-      Size (Pixels): 1
-      Size (m): 0.05000000074505806
+      Size (Pixels): 2
+      Size (m): 0.019999999552965164
       Style: Points
       Topic: /aggregate_cloud
       Unreliable: false
@@ -214,6 +215,18 @@ Visualization Manager:
         {}
       Queue Size: 100
       Value: true
+    - Class: octomap_rviz_plugin/OccupancyGrid
+      Enabled: false
+      Max. Height Display: 1
+      Max. Octree Depth: 16
+      Min. Height Display: -1
+      Name: OccupancyGrid
+      Octomap Topic: /field_octomap
+      Queue Size: 5
+      Value: false
+      Voxel Alpha: 1
+      Voxel Coloring: Z-Axis
+      Voxel Rendering: All Voxels
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -242,7 +255,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 113.6370849609375
+      Distance: 25.774303436279297
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -250,17 +263,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 72.54759979248047
-        Y: 5.345848560333252
-        Z: -43.24736404418945
-      Focal Shape Fixed Size: true
+        X: 8.506871223449707
+        Y: -11.91963005065918
+        Z: -6.098508358001709
+      Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5597957372665405
+      Pitch: 0.3503985106945038
       Target Frame: <Fixed Frame>
-      Yaw: 3.330402374267578
+      Yaw: 5.738581657409668
     Saved: ~
 Window Geometry:
   Displays:

@@ -1,7 +1,7 @@
 <launch>
   <arg name="bag_filename"/>
   <arg name="rviz" default="true"/>
-  <arg name="max_cloud_count" default="400"/>
+  <arg name="max_cloud_count" default="100"/>
 
   <!-- starting bag file -->       
   <node name="playbag" pkg="rosbag" type="play"
@@ -39,6 +39,9 @@
   	<param name="apply_smoothing" value="true"/>
   	<param name="align_clouds" value="false"/>
   	<param name="max_cloud_count" value="$(arg max_cloud_count)"/>
+  	<param name="octomap/resolution" value="0.06"/>
+  	<param name="octomap/mean_k" value="40"/>
+  	<param name="octomap/stdv_mult" value="0.6"/>
   	<rosparam param="min_box_bounds">[-4.0, 1.0, -5.0]</rosparam>
   	<rosparam param="max_box_bounds">[4.0, 4.0, 5.0]</rosparam>
   	<rosparam param="offset_transform">[0.0, 0.0, 0.0, -50.0, 0.0, 55.0]</rosparam><!--[x, y, x, euler_x, euler_y, euler_z]-->
