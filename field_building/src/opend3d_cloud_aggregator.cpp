@@ -1,0 +1,519 @@
+/*
+ * opend3d_cloud_aggregator.cpp
+ *
+ *  Created on: Jan 25, 2023
+ *      Author: jorge.nicho
+ */
+
+#include <optional>
+
+#include <glog/logging.h>
+
+#include <ros/ros.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf_conversions/tf_eigen.h>
+#include <tf2_eigen/tf2_eigen.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+
+#include <sensor_msgs/PointCloud2.h>
+#include <std_srvs/Trigger.h>
+
+#include <pcl/pcl_macros.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl/octree/octree_pointcloud_voxelcentroid.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/surface/mls.h>
+
+#include <open3d/Open3D.h>
+#include <open3d/geometry/TetraMesh.h>
+#include <open3d/pipelines/registration/Registration.h>
+
+#include <octomap/octomap.h>
+#include <octomap_msgs/conversions.h>
+
+static const std::string CLOUD_TOPIC = "cloud_input";
+static const std::string AGGREGATE_CLOUD_TOPIC = "aggregate_cloud";
+static const std::string OCTOMAP_TOPIC = "field_octomap";
+static const std::string BUILD_OCTOMAP_SERVICE = "build_field_octomap";
+static const int WAIT_TRANSFORM_PAUSE = 0.01;
+
+using CloudT = open3d::geometry::PointCloud;
+using CloudPtr = std::shared_ptr<CloudT>;
+using CloudConstPtr = std::shared_ptr<CloudT>;
+using PCLCloudT = pcl::PointCloud<pcl::PointXYZ>;
+using PCLPointT = pcl::PointXYZ;
+
+Eigen::Isometry3d Interpolate(Eigen::Isometry3d& t1, Eigen::Isometry3d& t2, double alpha)
+{
+  using namespace Eigen;
+  Quaterniond rot1(t1.linear());
+  Quaterniond rot2(t2.linear());
+  Vector3d trans1(t1.translation());
+  Vector3d trans2(t2.translation());
+  Isometry3d result = Isometry3d::Identity();
+  result.translation() = (1.0 - alpha) * trans1 + alpha * trans2;
+  result.linear() = rot1.slerp(alpha, rot2).toRotationMatrix();
+  return result;
+}
+
+octomap::OcTree BuildFieldOctomap(PCLCloudT::Ptr cloud, const double resolution = 1.0)
+{
+  using PointT =PCLPointT;
+  std::vector< PointT, Eigen::aligned_allocator<PointT> > voxel_centers_vec;
+  {
+    pcl::octree::OctreePointCloudVoxelCentroid<PointT> octree(resolution);
+    octree.setInputCloud(cloud);
+    octree.addPointsFromInputCloud();
+    octree.getOccupiedVoxelCenters(voxel_centers_vec);
+  }
+  octomap::OcTree octree(resolution);
+  octree.enableChangeDetection(true);
+  for(const auto& voxel_center : voxel_centers_vec)
+  {
+    octree.updateNode(voxel_center.x, voxel_center.y, voxel_center.z, true, true);
+  }
+  octree.updateInnerOccupancy();
+  return octree;
+}
+
+std::optional<geometry_msgs::TransformStamped> GetTransform(tf2_ros::Buffer& tf_buffer, const std::string target_frame_id,
+                                             const std::string child_frame_id,
+                                             const ros::Time& requested_time){
+  geometry_msgs::TransformStamped tf_msg;
+  bool success = false;
+  for(std::size_t i = 0; i < 4 && ros::ok(); i++)
+  {
+    try
+    {
+      tf_msg = tf_buffer.lookupTransform(target_frame_id, child_frame_id, requested_time, ros::Duration(0.05));
+      success = true;
+      break;
+    }
+    catch(tf2::TransformException &ex)
+    {
+      ROS_ERROR_STREAM(ex.what());
+      continue;
+    }
+  }
+  if(success)
+  {
+    return tf_msg;
+  }
+  ROS_ERROR_STREAM("Failed to get transform from " <<target_frame_id << " to " << child_frame_id);
+  return std::nullopt;
+}
+
+template <class P>
+P LoadParameter(ros::NodeHandle& nh, const std::string& param_name)
+{
+  P param_val;
+  CHECK(nh.getParam(param_name, param_val)) <<"Failed to get parameter " << param_name;
+  return param_val;
+}
+
+template <class P, int size_>
+std::array<P, size_> LoadArrayParam(ros::NodeHandle& nh, const std::string& param_name)
+{
+  std::vector<P> vals;
+  CHECK(nh.getParam(param_name, vals)) << "Failed to get array parameter " << param_name;
+  CHECK(vals.size() == size_) << "Array size from parameter "<< param_name << " != " << size_;
+  std::array<P, size_> vals_arr;
+  std::copy_n(vals.begin(), vals.size(), vals_arr.begin());
+  return vals_arr;
+}
+
+PCLCloudT::Ptr ConvertToPCL(const CloudT& cloud)
+{
+  PCLCloudT::Ptr pcl_cloud = boost::make_shared<PCLCloudT>();
+  pcl_cloud->width = cloud.points_.size();
+  pcl_cloud->height = 1;
+  pcl_cloud->is_dense = false;
+  pcl_cloud->points.resize( cloud.points_.size() );
+
+  for( int32_t i = 0; i < cloud.points_.size(); i++ ){
+      pcl_cloud->points[i].getVector3fMap() = cloud.points_[i].cast<float>();
+  }
+  return pcl_cloud;
+}
+
+CloudPtr ConvertToOpen3D(const PCLCloudT& pcl_cloud)
+{
+  CloudPtr cloud(std::make_shared<CloudT>());
+  std::transform(pcl_cloud.begin(), pcl_cloud.end(), std::back_inserter(cloud->points_), [](const PCLPointT& p){
+    return p.getVector3fMap().cast<double>();
+  });
+  return cloud;
+}
+
+class CloudAggregator
+{
+public:
+
+  struct CloudWithPose
+  {
+    sensor_msgs::PointCloud2 cloud_msg;
+    Eigen::Isometry3d pose;
+  };
+
+  CloudAggregator(ros::NodeHandle& nh):
+    tf_listener_(tf_buffer_),
+    child_frame_id_("gps"),
+    target_frame_id_("odom"),
+    offset_transform_(Eigen::Isometry3d::Identity()),
+    apply_plane_adjustment_(false),
+    align_clouds_(false),
+    max_cloud_count_(100),
+    min_distance_(1.0),
+    voxel_leaf_size_(0.05),
+    cloud_count_(0),
+    previous_processed_cloud_(std::make_shared<CloudT>()),
+    aggregate_cloud_(std::make_shared<CloudT>()),
+    previous_cloud_pose_(std::nullopt)
+  {
+    using namespace Eigen;
+    // loading parameters
+    ros::NodeHandle ph("~");
+    ph.param("max_cloud_count", max_cloud_count_, 500);
+    ph.param("voxel_leaf_size", voxel_leaf_size_, 0.05);
+    ph.param("apply_plane_adjustment", apply_plane_adjustment_, false);
+    ph.param("apply_smoothing", apply_smoothing_, false);
+    ph.param("align_clouds", align_clouds_, false);
+    min_distance_ = LoadParameter<double>(ph, "min_distance");
+    child_frame_id_ = LoadParameter<std::string>(ph, "child_frame_id");
+    target_frame_id_ = LoadParameter<std::string>(ph, "target_frame_id");
+    min_box_bounds_ = LoadArrayParam<double, 3>(ph, "min_box_bounds");
+    max_box_bounds_ = LoadArrayParam<double, 3>(ph, "max_box_bounds");
+
+    std::vector<double> offset_transform_vals = LoadParameter< std::vector<double> >(ph, "offset_transform");
+    CHECK(offset_transform_vals.size() == 6) <<" Offset transform array requires 6 entries, only "<<
+        offset_transform_vals.size()<<" were passed";
+    std::array<double,6> temp_vals;
+    std::copy_n(offset_transform_vals.begin(), offset_transform_vals.size(), temp_vals.begin());
+    auto [x, y, z, rx, ry, rz] = temp_vals;
+    offset_transform_ = Translation3d(x, y, z) *
+        AngleAxisd(DEG2RAD(rz), Vector3d::UnitZ()) *
+        AngleAxisd(DEG2RAD(ry), Vector3d::UnitY()) *
+        AngleAxisd(DEG2RAD(rx), Vector3d::UnitX());
+
+    // Initializing ROS interfaces
+    cloud_subscriber_ = nh.subscribe(CLOUD_TOPIC, 1, &CloudAggregator::CloudMsgCallback, this);
+    aggregate_cloud_publisher_ = nh.advertise<sensor_msgs::PointCloud2>(AGGREGATE_CLOUD_TOPIC,1);
+    octomap_publisher_ = nh.advertise<octomap_msgs::Octomap>(OCTOMAP_TOPIC,1);
+    aggregation_timer_ = nh.createTimer(ros::Duration(0.2), &CloudAggregator::AggregationCalback, this);
+    publish_visualization_results_timer_ = nh.createTimer(ros::Duration(2.0),[this](const ros::TimerEvent&){
+      PublishAggregateCloud();
+      PublishAggregateOctomap();
+    });
+    build_octomap_server_ = nh.advertiseService<std_srvs::Trigger::Request, std_srvs::Trigger::Response>(
+        BUILD_OCTOMAP_SERVICE,[this](std_srvs::Trigger::Request& req, std_srvs::Trigger::Response& res)-> bool{
+      ros::NodeHandle ph("~");
+      octomap_msg_ = boost::make_shared<octomap_msgs::Octomap>();
+
+      double octomap_resolution;
+      int mean_k;
+      double std_mult;
+      ph.param("octomap/resolution", octomap_resolution, 0.5);
+      ph.param("octomap/mean_k", mean_k, 10);
+      ph.param("octomap/stdv_mult", std_mult, 0.7);
+      CloudPtr full_cloud = std::make_shared<CloudT>(*aggregate_cloud_);
+      RemoveOutliers(full_cloud, mean_k, std_mult);
+      SmoothCloudMLS(full_cloud, 3/* polynomial order */, octomap_resolution);
+      octomap::OcTree octree = BuildFieldOctomap(ConvertToPCL(*full_cloud), octomap_resolution);
+      octomap_msgs::fullMapToMsg(octree, *octomap_msg_);
+      res.success = true;
+      return true;
+    });
+
+    application_start_time_ = ros::Time::now();
+
+    ROS_INFO("Open3D cloud aggregator ready");
+  }
+
+  ~CloudAggregator()
+  {
+
+  }
+
+private:
+
+  void CloudMsgCallback(const sensor_msgs::PointCloud2& msg)
+  {
+    if(!first_msg_time_)
+    {
+      first_msg_time_ = msg.header.stamp;
+    }
+    if(cloud_count_ > max_cloud_count_)
+    {
+      return;
+    }
+
+    // getting clouds transform
+    ros::Duration(WAIT_TRANSFORM_PAUSE).sleep();
+    ros::Time transform_time = application_start_time_ + (msg.header.stamp - first_msg_time_.value());
+    std::optional<geometry_msgs::TransformStamped> tf_msg = GetTransform(tf_buffer_, target_frame_id_,
+                                                                         msg.header.frame_id,
+                                                                         transform_time);
+    if(!tf_msg)
+    {
+      return;
+    }
+    Eigen::Isometry3d current_pose = tf2::transformToEigen(tf_msg.value());
+    CloudWithPose cloud_entry = {.cloud_msg = msg, .pose = current_pose};
+
+    if(!previous_cloud_pose_)
+    {
+      clouds_list_.emplace_back(std::move(cloud_entry));
+      previous_cloud_pose_ = current_pose;
+      return;
+    }
+
+    // check distance from previous cloud
+    const Eigen::Isometry3d& previous_pose = previous_cloud_pose_.value();
+    Eigen::Vector3d prev_position = previous_pose.translation();
+    Eigen::Vector3d current_position = current_pose.translation();
+
+    double dist = (current_position - prev_position).norm();
+    ROS_DEBUG("Distance %f, required min distance %f", dist, min_distance_);
+    if(dist < min_distance_)
+    {
+      return;
+    }
+
+    previous_cloud_pose_ = current_pose;
+
+    clouds_list_.emplace_back(std::move(cloud_entry));
+    ROS_DEBUG_STREAM("Stored cloud, total cloud count " << clouds_list_.size());
+  }
+
+  void ApplyPlaneRectification(CloudPtr cloud)
+  {
+    Eigen::Vector4d coeffs;
+    std::vector<std::size_t> inliers;
+    std::tie(coeffs, inliers) = cloud->SegmentPlane(0.05, 3, 200);
+
+    if(inliers.empty())
+    {
+      ROS_ERROR("Plane estimation failed");
+      return;
+    }
+
+    Eigen::Vector3d plane_normal(coeffs[0], coeffs[1], coeffs[2]);
+    double angle = std::acos(plane_normal.dot(Eigen::Vector3d::UnitZ())/(plane_normal.norm()));
+    Eigen::Vector3d rot_axis = plane_normal.cross(Eigen::Vector3d::UnitZ()).normalized();
+    ROS_DEBUG_STREAM("Angle Axes values: " << angle <<" x: " << rot_axis.x() << " y: " << rot_axis.y() << " z: " << rot_axis.z());
+
+    // computing centroid
+    Eigen::Vector3d centroid_vals = cloud->GetCenter();
+    Eigen::Vector3d centroid(centroid_vals.x(), centroid_vals.y(), centroid_vals.z());
+
+    // moving to world plane level (z = 0)
+    Eigen::Affine3d cloud_transform = Eigen::Translation3d( centroid.x(), centroid.y(), 0.0) * Eigen::AngleAxisd(angle, rot_axis)
+        * Eigen::Translation3d(-1.0 * centroid)*Eigen::Quaterniond::Identity();
+    cloud->Transform(cloud_transform.matrix());
+  }
+
+  void SmoothCloudMLS(CloudPtr cloud, std::size_t polynomial_order = 3, double search_radius = 0.05)
+  {
+    PCLCloudT::Ptr pcl_cloud = ConvertToPCL(*cloud);
+    pcl::MovingLeastSquares<pcl::PointXYZ, pcl::PointNormal> mls;
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr search_tree (new pcl::search::KdTree<pcl::PointXYZ>);
+
+    mls.setComputeNormals (true);
+
+    // Set parameters
+    mls.setInputCloud(pcl_cloud);
+    mls.setPolynomialOrder(polynomial_order);
+    mls.setSearchMethod (search_tree);
+    mls.setSearchRadius (search_radius);
+
+    // Reconstruct
+    pcl::PointCloud<pcl::PointNormal> mls_points;
+    mls.process(mls_points);
+
+    cloud->Clear();
+    cloud->points_.reserve(mls_points.size());
+    std::transform(mls_points.begin(), mls_points.end(), std::back_inserter(cloud->points_),
+                   [](const pcl::PointNormal& p){
+      return p.getVector3fMap().cast<double>();
+    });
+  }
+
+  void RemoveOutliers(CloudPtr cloud, std::size_t mean_k = 20, double stdv_mult = 1.0)
+  {
+    CloudPtr downsampled_cloud;
+    std::vector<std::size_t> inliers;
+    std::tie(downsampled_cloud, inliers) = cloud->RemoveStatisticalOutliers(mean_k, stdv_mult);
+    *cloud = *downsampled_cloud;
+  }
+
+
+  void AlignCloudICP(CloudConstPtr target_cloud, CloudPtr input_cloud)
+  {
+    using namespace open3d::pipelines::registration;
+    const double max_correspondence_distance = 0.05;
+    RegistrationResult result = RegistrationICP(*input_cloud,
+                                                     *target_cloud,
+                                                     max_correspondence_distance);
+    input_cloud->Transform(result.transformation_);
+  }
+
+  void AggregationCalback(const ros::TimerEvent&)
+  {
+    ros::Time start_time = ros::Time::now();
+    if(cloud_count_ > max_cloud_count_)
+    {
+      ROS_INFO_STREAM_ONCE("Max cloud count "<< max_cloud_count_ << " reached, aggregation stopped");
+      return;
+    }
+
+    if(clouds_list_.size() <2)
+    {
+      return;
+    }
+
+    CloudT temp_aggregate_cloud;
+    for(std::size_t i = 0; i < clouds_list_.size(); i++)
+    {
+      if(cloud_count_ > max_cloud_count_)
+      {
+        break;
+      }
+      Eigen::Isometry3d current_pose = clouds_list_[i].pose * offset_transform_;
+      PCLCloudT::Ptr pcl_raw_cloud = boost::make_shared<PCLCloudT>();
+      pcl::fromROSMsg(clouds_list_[i].cloud_msg, *pcl_raw_cloud);
+
+      CloudPtr raw_cloud = ConvertToOpen3D(*pcl_raw_cloud);
+
+      // applying cloud filters
+      ApplyCloudFilters(*raw_cloud);
+
+      // transforming
+      CloudPtr transformed_cloud = std::make_shared<CloudT>(raw_cloud->Transform(current_pose.matrix()));
+
+      // forcing cloud to ground plane
+      if(apply_plane_adjustment_)
+      {
+        ApplyPlaneRectification(transformed_cloud);
+      }
+
+      if(apply_smoothing_)
+      {
+        SmoothCloudMLS(transformed_cloud);
+      }
+
+      if(align_clouds_ && !previous_processed_cloud_->IsEmpty())
+      {
+        AlignCloudICP(previous_processed_cloud_, transformed_cloud);
+      }
+      previous_processed_cloud_->Clear();
+      (*previous_processed_cloud_) = *transformed_cloud;
+
+      temp_aggregate_cloud += *transformed_cloud;
+      cloud_count_++;
+
+    }
+    clouds_list_.clear();
+    *aggregate_cloud_ += temp_aggregate_cloud;
+
+    Eigen::Vector3d min_point = temp_aggregate_cloud.GetMinBound();
+    Eigen::Vector3d max_point = temp_aggregate_cloud.GetMaxBound();
+
+    ros::Duration processing_duration = ros::Time::now() - start_time;
+    ROS_INFO_STREAM("Aggregation processing took " << processing_duration.toSec() <<" seconds" <<
+                    ": minmax z( " << min_point.z() <<", " << max_point.z() <<")");
+  }
+
+  void ApplyCloudFilters(CloudT& cloud)
+  {
+    CloudPtr filtered_cloud = std::make_shared<CloudT>(cloud);
+
+    // voxel grid
+    if(voxel_leaf_size_ > std::numeric_limits<double>::epsilon())
+    {
+      filtered_cloud = filtered_cloud->VoxelDownSample(voxel_leaf_size_);
+    }
+
+    // crop box
+    auto [min_x, min_y, min_z] = min_box_bounds_;
+    auto [max_x, max_y, max_z] = max_box_bounds_;
+    open3d::geometry::AxisAlignedBoundingBox aabb(Eigen::Vector3d(min_x, min_y, min_z),
+                                                  Eigen::Vector3d(max_x, max_y, max_z));
+    filtered_cloud = filtered_cloud->Crop(aabb);
+
+    // statistical outlier
+    RemoveOutliers(filtered_cloud);
+
+    // copy results
+    cloud = *filtered_cloud;
+  }
+
+  void PublishAggregateCloud()
+  {
+    sensor_msgs::PointCloud2 aggregate_cloud_msg;
+    PCLCloudT::Ptr pcl_aggregate_cloud = ConvertToPCL(*aggregate_cloud_);
+    pcl::toROSMsg(*pcl_aggregate_cloud, aggregate_cloud_msg);
+    aggregate_cloud_msg.header.frame_id = target_frame_id_;
+    aggregate_cloud_msg.header.stamp = ros::Time::now();
+    aggregate_cloud_publisher_.publish(aggregate_cloud_msg);
+  }
+
+  void PublishAggregateOctomap()
+  {
+    if(!octomap_msg_)
+    {
+      return;
+    }
+    octomap_msg_->header.frame_id = target_frame_id_;
+    octomap_msg_->header.stamp = ros::Time::now();
+    octomap_publisher_.publish(*octomap_msg_);
+  }
+
+  // ros interfaces
+  ros::Timer aggregation_timer_;
+  ros::Timer publish_visualization_results_timer_;
+  ros::Subscriber cloud_subscriber_;
+  ros::Publisher aggregate_cloud_publisher_;
+  ros::Publisher octomap_publisher_;
+  ros::ServiceServer build_octomap_server_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  // ros parameters
+  std::string child_frame_id_;
+  std::string target_frame_id_;
+  Eigen::Isometry3d offset_transform_;
+  bool apply_plane_adjustment_;
+  bool apply_smoothing_;
+  bool align_clouds_;
+  int max_cloud_count_;
+  double min_distance_; // minimum distance from the previous cloud pose required to store new cloud
+  double voxel_leaf_size_;
+  std::array<double, 3> min_box_bounds_;
+  std::array<double, 3> max_box_bounds_;
+
+
+  // intermediate members
+  std::optional<geometry_msgs::TransformStamped> previous_transform_msg_;
+  std::shared_ptr<CloudT> previous_processed_cloud_;
+  std::optional<Eigen::Isometry3d> previous_cloud_pose_;
+  std::vector<CloudWithPose> clouds_list_;
+  std::size_t cloud_count_;
+  ros::Time application_start_time_;
+  std::optional<ros::Time> first_msg_time_;
+
+  // output
+  std::shared_ptr<CloudT> aggregate_cloud_;
+  octomap_msgs::OctomapPtr octomap_msg_;
+
+};
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "cloud_aggregator");
+  ros::NodeHandle nh;
+  CloudAggregator cloud_aggregator(nh);
+  ros::spin();
+
+  return 0;
+}

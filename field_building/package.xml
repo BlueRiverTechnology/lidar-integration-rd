@@ -14,6 +14,9 @@
   <depend>geometry_msgs</depend>
   <depend>gps_common</depend>
   <depend>octomap_ros</depend>
+  <!--<depend>open3d_conversions</depend>-->
+  
+  <exec_depend>octomap_rviz_plugins</exec_depend>
 
   <!-- The export tag contains other, unspecified, tags -->
   <export>

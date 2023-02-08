@@ -1,7 +1,10 @@
 <launch>
   <arg name="bag_filename"/>
   <arg name="rviz" default="true"/>
-  <arg name="max_cloud_count" default="100"/>
+  <arg name="max_cloud_count" default="200"/>
+  <arg name="use_open3d" default="false"/>
+  <arg name="aggregator_exec" if="$(arg use_open3d)" value="open3d_cloud_aggregator"/>
+  <arg name="aggregator_exec" unless="$(arg use_open3d)" value="cloud_aggregator"/>
 
   <!-- starting bag file -->       
   <node name="playbag" pkg="rosbag" type="play"
@@ -30,7 +33,8 @@
   	<rosparam param="position_offsets">[631902.0, 4090677.0, 0.0]</rosparam>
   </node>
   
-  <node name="cloud_aggregator" type="cloud_aggregator" pkg="field_building" output="screen">
+  <!--<node name="cloud_aggregator" type="cloud_aggregator" pkg="field_building" output="screen">-->
+  <node name="cloud_aggregator" type="$(arg aggregator_exec)" pkg="field_building" output="screen">
 	<param name="target_frame_id" value="odom"/>
   	<param name="child_frame_id" value="gps"/>
   	<param name="voxel_leaf_size" value="-0.05"/>
